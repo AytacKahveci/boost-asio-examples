@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package filetransfer;
+
+// Client to Server
+message ClientMessage {
+  oneof content {
+    FileTransferRequest file_request = 1;
+    FileChunk file_chunk = 2;
+    FileUploadFinished upload_finished = 3;
+  }
+}
+
+// Server to Client
+message ServerMessage {
+  FileUploadStatus upload_status = 1;
+}
+
+message FileTransferRequest {
+  string filename = 1;
+  uint64 filesize = 2;
+}
+
+// A piece of a file
+message FileChunk {
+  string filename = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool is_last_chunk = 4;
+}
+
+message FileUploadFinished {
+  string filename = 1;
+  string message = 2;
+}
+
+message FileUploadStatus {
+  string filename = 1;
+  string status_message = 2;
+  bool success = 3;
+  uint64 bytes_received = 4;
+}
