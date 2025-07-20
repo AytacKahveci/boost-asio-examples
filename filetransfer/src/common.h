@@ -8,7 +8,7 @@
 #include <arpa/inet.h> // For htonl/ntohl
 #include <memory>      // For std::shared_ptr, std::unique_ptr
 #include <functional>  // For std::function
-#include <zlib.h> // For crc32
+#include <zlib.h>      // For crc32
 #include "filetransfer.pb.h"
 
 namespace ba = boost::asio;
@@ -21,7 +21,7 @@ const size_t CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB chunk size
 struct ProtocolHeader
 {
   uint32_t mMagicBytes;
-  uint8_t  mVersion;
+  uint8_t mVersion;
   uint32_t mPayloadSize;
   uint32_t mChecksum;
 
@@ -51,18 +51,18 @@ void AsyncWriteProtobufMessage(bai::tcp::socket &socket, const T &message,
   std::string serializedData;
   if (!message.SerializeToString(&serializedData))
   {
-    boost::system::error_code ec(boost::asio::error::invalid_argument, boost::asio::error::netdb_errors::no_data);
-    socket.get_io_context().post([handler, ec]()
-                                 { handler(ec, 0); });
+    boost::system::error_code ec(boost::system::errc::make_error_code(boost::system::errc::no_message));
+    ba::post(socket.get_executor(), [handler, ec]()
+                                { handler(ec, 0); });
     return;
   }
 
   ProtocolHeader header;
-  header.magic_bytes = PROTOCOL_MAGIC_BYTES;
-  header.version = PROTOCOL_VERSION;
-  header.payload_size = static_cast<uint32_t>(serializedData.length());
+  header.mMagicBytes = PROTOCOL_MAGIC_BYTES;
+  header.mVersion = PROTOCOL_VERSION;
+  header.mPayloadSize = static_cast<uint32_t>(serializedData.length());
   // Calculate checksum
-  header.checksum = crc32(0L, reinterpret_cast<const Bytef *>(serializedData.data()), serializedData.length());
+  header.mChecksum = crc32(0L, reinterpret_cast<const Bytef *>(serializedData.data()), serializedData.length());
 
   header.ToNetworkByteOrder();
 
@@ -90,26 +90,26 @@ void AsyncReadProtobufMessage(bai::tcp::socket &socket, ba::streambuf &buffer,
                      pHeader->ToHostByteOrder();
 
                      // Magic bytes check
-                     if (pHeader->magic_bytes != PROTOCOL_MAGIC_BYTES)
+                     if (pHeader->mMagicBytes != PROTOCOL_MAGIC_BYTES)
                      {
                        std::cerr << "Error: Invalid magic bytes. Expected: 0x"
                                  << std::hex << PROTOCOL_MAGIC_BYTES << ", Received: 0x"
-                                 << std::hex << pHeader->magic_bytes << std::endl;
+                                 << std::hex << pHeader->mMagicBytes << std::endl;
                        handler(boost::asio::error::invalid_argument, 0, nullptr);
                        return;
                      }
                      // Version check
-                     if (pHeader->version != PROTOCOL_VERSION)
+                     if (pHeader->mVersion != PROTOCOL_VERSION)
                      {
                        std::cerr << "Error Protocol Version Expected: "
-                                 << (int)PROTOCOL_VERSION << ", Received: " << (int)pHeader->version << std::endl;
-                       handler(boost::asio::error::version, 0, nullptr);
+                                 << (int)PROTOCOL_VERSION << ", Received: " << (int)pHeader->mVersion << std::endl;
+                       handler(boost::system::errc::make_error_code(boost::system::errc::errc_t::protocol_error), 0, nullptr);
                        return;
                      }
 
                      // Read payload
-                     buffer.prepare(pHeader->payload_size);
-                     ba::async_read(socket, buffer.prepare(pHeader->payload_size),
+                     buffer.prepare(pHeader->mPayloadSize);
+                     ba::async_read(socket, buffer.prepare(pHeader->mPayloadSize),
                                     [&socket, &buffer, handler, pHeader, pSelf](const boost::system::error_code &error2, size_t bytes_transferred2)
                                     {
                                       if (!error2)
@@ -119,11 +119,11 @@ void AsyncReadProtobufMessage(bai::tcp::socket &socket, ba::streambuf &buffer,
                                         // Payload checksum check
                                         uint32_t calculated_checksum = crc32(0L,
                                                                              reinterpret_cast<const Bytef *>(boost::asio::buffer_cast<const char *>(buffer.data())),
-                                                                             pHeader->payload_size);
+                                                                             pHeader->mPayloadSize);
 
-                                        if (calculated_checksum != pHeader->checksum)
+                                        if (calculated_checksum != pHeader->mChecksum)
                                         {
-                                          std::cerr << "Error: Checksum not valid! Expected: 0x" << std::hex << pHeader->checksum
+                                          std::cerr << "Error: Checksum not valid! Expected: 0x" << std::hex << pHeader->mChecksum
                                                     << ", Calculated: 0x" << std::hex << calculated_checksum << std::endl;
                                           handler(boost::asio::error::fault, 0, nullptr);
                                           buffer.consume(bytes_transferred2);
@@ -131,7 +131,7 @@ void AsyncReadProtobufMessage(bai::tcp::socket &socket, ba::streambuf &buffer,
                                         }
 
                                         auto message_ptr = std::make_unique<T>();
-                                        if (message_ptr->ParseFromArray(boost::asio::buffer_cast<const char *>(buffer.data()), pHeader->payload_size))
+                                        if (message_ptr->ParseFromArray(boost::asio::buffer_cast<const char *>(buffer.data()), pHeader->mPayloadSize))
                                         {
                                           handler(boost::system::error_code(), bytes_transferred2, std::move(message_ptr));
                                         }

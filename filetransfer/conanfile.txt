@@ -1,0 +1,16 @@
+[requires]
+boost/1.74.0
+protobuf/5.27.0
+zlib/1.3
+
+[tool_requires]
+boost/1.74.0
+protobuf/5.27.0
+zlib/1.3
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[options]
+protobuf/*:shared=True
