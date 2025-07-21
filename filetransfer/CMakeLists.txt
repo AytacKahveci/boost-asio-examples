@@ -55,3 +55,17 @@ add_custom_target(generate_proto_files
     ${PROTO_GENERATED_HDRS}
 )
 add_dependencies(file_server generate_proto_files)
+
+add_executable(file_client
+  src/file_client.cpp
+  src/common.h
+  ${PROTO_GENERATED_SRCS}
+)
+
+target_link_libraries(file_client
+  ${protobuf_LIBRARIES}
+  ${Boost_LIBRARIES}
+  ${ZLIB_LIBRARIES}
+)
+
+add_dependencies(file_client generate_proto_files)
