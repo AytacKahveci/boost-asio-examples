@@ -8,13 +8,16 @@
 namespace ba = boost::asio;
 namespace bai = boost::asio::ip;
 
-class Session {
+class Session : public std::enable_shared_from_this<Session> {
   public:
-    Session(ba::io_context& context) : mSocket(context) {}
+    Session(ba::io_context& context) : mSocket(std::make_shared<bai::tcp::socket>(context)) 
+    {
+      mBuffer.prepare(sizeof(ProtocolHeader));
+    }
 
     bai::tcp::socket& GetSocket()
     {
-      return mSocket;
+      return *mSocket;
     }
 
     void Start() 
@@ -23,16 +26,45 @@ class Session {
     }
 
   private:
-    void ReadHeader() {
-        AsyncReadProtobufMessage<filetransfer::ClientMessage>(mSocket, mBuffer,
-                                 [this](const boost::system::error_code &error, size_t sz,
-                                    std::unique_ptr<filetransfer::ClientMessage> message) {
-                                      HandleRead(error, sz, std::move(message));
-                                 });
+    void ReadHeader() 
+    {
+      auto self(shared_from_this());
+      AsyncReadProtobufMessageHeader(mSocket, mBuffer,
+                                [self](const boost::system::error_code &error, size_t sz,
+                                  std::shared_ptr<ProtocolHeader> header) {
+                                    self->HandleReadHeader(error, sz, header);
+                                });
     }
 
-    void HandleRead(const boost::system::error_code& error, size_t transferredByte,
-                    std::unique_ptr<filetransfer::ClientMessage> message) 
+    void ReadPayload(std::shared_ptr<ProtocolHeader> pHeader)
+    {
+      auto self(shared_from_this());
+      mData.clear();
+      mData.resize(pHeader->mPayloadSize);
+      AsyncReadProtobufMessagePayload<filetransfer::ClientMessage>(mSocket, mData, pHeader,
+                                [self](const boost::system::error_code &error, size_t sz,
+                                  std::shared_ptr<filetransfer::ClientMessage> message) {
+                                    self->HandleReadPayload(error, sz, message);
+                                });
+    }
+
+    void HandleReadHeader(const boost::system::error_code& error, size_t transferredByte,
+                          std::shared_ptr<ProtocolHeader> header) 
+    {
+      if (!error && header)
+      {
+        auto self(shared_from_this());
+        self->ReadPayload(header);
+      }
+      else
+      {
+        std::cout << "Error in HandleReadHeader: " << error.message() << std::endl;
+      }
+    }
+
+
+    void HandleReadPayload(const boost::system::error_code& error, size_t transferredByte,
+                    std::shared_ptr<filetransfer::ClientMessage> message) 
     {
       if (!error && message)
       {
@@ -59,7 +91,7 @@ class Session {
         {
           mOut.close();
         }
-        std::cout << "Error in HandleRead: " << error.message() << std::endl;
+        std::cout << "Error in HandleReadPayload: " << error.message() << std::endl;
       }
     }
 
@@ -73,7 +105,7 @@ class Session {
       boost::filesystem::path filePath(targetPath);
       if (boost::filesystem::exists(filePath))
       {
-        std::cout << "File is already exists. It will be overridden" << std::endl;
+        std::cerr << "File is already exists. It will be overridden" << std::endl;
       }
 
       boost::filesystem::create_directories("uploads");
@@ -81,7 +113,7 @@ class Session {
       mOut.open(targetPath, std::ios_base::binary | std::ios_base::trunc);
       if (!mOut.is_open())
       {
-        std::cout << "File couldn't be open: " << targetPath << std::endl;
+        std::cerr << "File couldn't be open: " << targetPath << std::endl;
         SendUploadStatus(request.filename(), "File couldn't be open", false, 0);
         return;
       }
@@ -94,7 +126,7 @@ class Session {
     {
       if (!mOut.is_open() || chunk.filename() != mCurrentFilename)
       {
-        std::cout << "Wrong filename" << std::endl;
+        std::cerr << "Wrong filename" << std::endl;
         SendUploadStatus(chunk.filename(), "Wrong filename", false, 0);
         return;
       }
@@ -105,7 +137,7 @@ class Session {
       mBytesReceived += chunk.data().length();
 
       std::cout << "Received: " << mBytesReceived << " Remaining: "
-                << static_cast<double>(mBytesReceived / mCurrentFileSize) * 100.0
+                << static_cast<double>(mBytesReceived) / mCurrentFileSize * 100.0
                 << "%" << std::endl;
         
       if (mBytesReceived >= mCurrentFileSize || chunk.is_last_chunk())
@@ -139,28 +171,25 @@ class Session {
       status->set_success(success);
       status->set_bytes_received(receivedBytes);
 
-      AsyncWriteProtobufMessage(mSocket, serverMsg, [] (const auto& error, auto /* sz */) {
+      AsyncWriteProtobufMessage(*mSocket, serverMsg, [] (const auto& error, auto /* sz */) {
         if (error)
         {
-          std::cout << "SendUploadStatus write error: " << error.message() << std::endl;
+          std::cerr << "SendUploadStatus write error: " << error.message() << std::endl;
         }
       });
     }
 
     void HandleWrite(const boost::system::error_code& error, size_t transferredByte) {
-      if (!error)
+      if (error)
       {
-
-      }
-      else
-      {
-        std::cout << "Error in HandleWrite: " << error.message() << std::endl;
+        std::cerr << "Error in HandleWrite: " << error.message() << std::endl;
       }
     }
 
   private:
-    bai::tcp::socket mSocket;
+    std::shared_ptr<bai::tcp::socket> mSocket;
     ba::streambuf mBuffer;
+    std::vector<char> mData;
     std::ofstream mOut;
     std::string mCurrentFilename{""};
     size_t mCurrentFileSize{0};
@@ -192,12 +221,11 @@ private:
     }
     else
     {
-      std::cout << "Error in accept: " << error.message() << std::endl;
+      std::cerr << "Error in accept: " << error.message() << std::endl;
     }
 
     StartAccept();
   }
-
 
   ba::io_context& mContext;
   bai::tcp::acceptor mAcceptor;
@@ -216,7 +244,7 @@ int main()
   }
   catch (const std::exception& e)
   {
-    std::cout << "Server error: " << e.what() << std::endl;
+    std::cerr << "Server error: " << e.what() << std::endl;
   }
 
   return 0;

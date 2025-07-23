@@ -15,7 +15,7 @@ namespace ba = boost::asio;
 namespace bai = boost::asio::ip;
 
 const short PORT = 12345;
-const size_t CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB chunk size
+const size_t CHUNK_SIZE = 4; // 4 MB chunk size
 
 // Protocol Header
 struct ProtocolHeader
@@ -53,7 +53,7 @@ void AsyncWriteProtobufMessage(bai::tcp::socket &socket, const T &message,
   {
     boost::system::error_code ec(boost::system::errc::make_error_code(boost::system::errc::no_message));
     ba::post(socket.get_executor(), [handler, ec]()
-                                { handler(ec, 0); });
+             { handler(ec, 0); });
     return;
   }
 
@@ -68,22 +68,19 @@ void AsyncWriteProtobufMessage(bai::tcp::socket &socket, const T &message,
 
   std::vector<ba::const_buffer> buffers;
   buffers.push_back(ba::buffer(&header, sizeof(ProtocolHeader)));
-  buffers.push_back(ba::buffer(serializedData));
+  buffers.push_back(ba::buffer(serializedData, header.mPayloadSize));
 
   ba::async_write(socket, buffers, handler);
 }
 
-// Read a Protobuf message from socket
-template <typename T>
-void AsyncReadProtobufMessage(bai::tcp::socket &socket, ba::streambuf &buffer,
-                              std::function<void(const boost::system::error_code &, size_t, std::unique_ptr<T>)> handler)
+// Read Protobug message header from socket
+void AsyncReadProtobufMessageHeader(std::shared_ptr<bai::tcp::socket> socket, ba::streambuf &buffer,
+                                    std::function<void(const boost::system::error_code &, size_t, std::shared_ptr<ProtocolHeader>)> handler)
 {
   auto pHeader = std::make_shared<ProtocolHeader>();
-  auto pSelf = std::make_shared<bool>(true);
 
-  // Read Header first
-  ba::async_read(socket, ba::buffer(pHeader.get(), sizeof(ProtocolHeader)),
-                 [&socket, &buffer, handler, pHeader, pSelf](const boost::system::error_code &error, size_t bytes_transferred)
+  ba::async_read(*socket, ba::buffer(pHeader.get(), sizeof(ProtocolHeader)),
+                 [&socket, &buffer, handler, pHeader](const boost::system::error_code &error, size_t bytes_transferred)
                  {
                    if (!error)
                    {
@@ -107,45 +104,47 @@ void AsyncReadProtobufMessage(bai::tcp::socket &socket, ba::streambuf &buffer,
                        return;
                      }
 
-                     // Read payload
-                     buffer.prepare(pHeader->mPayloadSize);
-                     ba::async_read(socket, buffer.prepare(pHeader->mPayloadSize),
-                                    [&socket, &buffer, handler, pHeader, pSelf](const boost::system::error_code &error2, size_t bytes_transferred2)
-                                    {
-                                      if (!error2)
-                                      {
-                                        buffer.commit(bytes_transferred2);
+                     handler(boost::system::error_code(), bytes_transferred, pHeader);
+                     return;
+                   }
 
-                                        // Payload checksum check
-                                        uint32_t calculated_checksum = crc32(0L,
-                                                                             reinterpret_cast<const Bytef *>(boost::asio::buffer_cast<const char *>(buffer.data())),
-                                                                             pHeader->mPayloadSize);
+                   handler(error, 0, nullptr);
+                 });
+}
 
-                                        if (calculated_checksum != pHeader->mChecksum)
-                                        {
-                                          std::cerr << "Error: Checksum not valid! Expected: 0x" << std::hex << pHeader->mChecksum
-                                                    << ", Calculated: 0x" << std::hex << calculated_checksum << std::endl;
-                                          handler(boost::asio::error::fault, 0, nullptr);
-                                          buffer.consume(bytes_transferred2);
-                                          return;
-                                        }
+// Read a Protobuf message from socket
+template <typename T>
+void AsyncReadProtobufMessagePayload(std::shared_ptr<bai::tcp::socket> socket, std::vector<char> &buffer, std::shared_ptr<ProtocolHeader> pHeader,
+                                     std::function<void(const boost::system::error_code &, size_t, std::shared_ptr<T>)> handler)
+{
+  // Read payload
+  ba::async_read(*socket, ba::buffer(buffer.data(), pHeader->mPayloadSize),
+                 [&socket, &buffer, handler, pHeader](const boost::system::error_code &error, size_t bytesTransferred)
+                 {
+                   if (!error)
+                   {
+                     // Payload checksum check
+                     uint32_t calculated_checksum = crc32(0L,
+                                                          reinterpret_cast<const Bytef *>(buffer.data()),
+                                                          buffer.size());
 
-                                        auto message_ptr = std::make_unique<T>();
-                                        if (message_ptr->ParseFromArray(boost::asio::buffer_cast<const char *>(buffer.data()), pHeader->mPayloadSize))
-                                        {
-                                          handler(boost::system::error_code(), bytes_transferred2, std::move(message_ptr));
-                                        }
-                                        else
-                                        {
-                                          handler(boost::asio::error::invalid_argument, 0, nullptr);
-                                        }
-                                        buffer.consume(bytes_transferred2);
-                                      }
-                                      else
-                                      {
-                                        handler(error2, 0, nullptr);
-                                      }
-                                    });
+                     if (calculated_checksum != pHeader->mChecksum)
+                     {
+                       std::cerr << "Error: Checksum not valid! Expected: 0x" << std::hex << pHeader->mChecksum
+                                 << ", Calculated: 0x" << std::hex << calculated_checksum << std::endl;
+                       handler(boost::asio::error::fault, 0, nullptr);
+                       return;
+                     }
+
+                     auto message_ptr = std::make_shared<T>();
+                     if (message_ptr->ParseFromArray(buffer.data(), buffer.size()))
+                     {
+                       handler(boost::system::error_code(), bytesTransferred, message_ptr);
+                     }
+                     else
+                     {
+                       handler(boost::asio::error::invalid_argument, 0, nullptr);
+                     }
                    }
                    else
                    {
