@@ -9,6 +9,7 @@ include("${CMAKE_BINARY_DIR}/conan_toolchain.cmake")
 find_package(Boost REQUIRED COMPONENTS system thread filesystem)
 find_package(protobuf CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(absl CONFIG REQUIRED)
 
 get_filename_component(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto ABSOLUTE)
 set(PROTO_FILE "${PROTO_DIR}/filetransfer.proto")
@@ -47,6 +48,7 @@ target_link_libraries(file_server
   ${protobuf_LIBRARIES}
   ${Boost_LIBRARIES}
   ${ZLIB_LIBRARIES}
+  ${absl_LIBRARIES}
 )
 
 add_custom_target(generate_proto_files
@@ -66,6 +68,7 @@ target_link_libraries(file_client
   ${protobuf_LIBRARIES}
   ${Boost_LIBRARIES}
   ${ZLIB_LIBRARIES}
+  ${absl_LIBRARIES}
 )
 
 add_dependencies(file_client generate_proto_files)

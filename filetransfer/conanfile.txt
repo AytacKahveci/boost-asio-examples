@@ -2,11 +2,13 @@
 boost/1.74.0
 protobuf/5.27.0
 zlib/1.3
+abseil/20250127.0
 
 [tool_requires]
 boost/1.74.0
 protobuf/5.27.0
 zlib/1.3
+abseil/20250127.0
 
 [generators]
 CMakeDeps
