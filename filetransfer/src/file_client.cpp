@@ -11,28 +11,35 @@ namespace ba = boost::asio;
 namespace bai = boost::asio::ip;
 namespace fs = boost::filesystem;
 
-
-class Client
+class Client : public std::enable_shared_from_this<Client>
 {
 public:
   using ReceiveHandlerT = std::function<void(const boost::system::error_code &error, size_t sz,
-                                             std::unique_ptr<filetransfer::ServerMessage>)>;
+                                             std::shared_ptr<filetransfer::ServerMessage>)>;
+  using ConnectCompletionHandlerT = std::function<void(const boost::system::error_code &error)>;
 
   Client(ba::io_context &context, const std::string &host, const std::string &port)
-      : mSocket(context), mResolver(context)
+      : mContext(context), mpSocket(std::make_shared<bai::tcp::socket>(context)), mResolver(context)
   {
     mEndpoints = mResolver.resolve(host, port);
   }
 
-  void Start()
+  void Start(ConnectCompletionHandlerT connectHandler)
   {
-    ba::async_connect(mSocket, mEndpoints, std::bind(&Client::ConnectHandler, this, std::placeholders::_1, std::placeholders::_2));
+    mConnectCompletionHandler = connectHandler;
+    ba::async_connect(*mpSocket, mEndpoints, std::bind(&Client::ConnectHandler, shared_from_this(), std::placeholders::_1, std::placeholders::_2));
+  }
+
+  void Stop()
+  {
+    mContext.post([this] () { mpSocket->close(); });
   }
 
   void Send(const filetransfer::ClientMessage &message,
             std::function<void(const boost::system::error_code &, size_t)> handler)
   {
-    AsyncWriteProtobufMessage(mSocket, message, handler);
+    auto self(shared_from_this());
+    AsyncWriteProtobufMessage(*mpSocket, message, handler);
   }
 
   void SetReceiveHandler(const ReceiveHandlerT &handler)
@@ -46,39 +53,95 @@ private:
     if (!error)
     {
       std::cout << "Client is connected to the server: " << endpoint << std::endl;
-      Read();
+      ReadHeader();
     }
     else
     {
-      std::cout << "Connect error: " << error.message() << std::endl;
+      std::cerr << "Connect error: " << error.message() << std::endl;
+    }
+
+    if (mConnectCompletionHandler)
+    {
+      mConnectCompletionHandler(error);
     }
   }
 
-  void Read()
+  void ReadHeader()
   {
-    AsyncReadProtobufMessage<filetransfer::ServerMessage>(mSocket, mBuffer,
-                                                          [this](const boost::system::error_code &error, size_t sz,
-                                                                 std::unique_ptr<filetransfer::ServerMessage> message)
-                                                          {
-                                                            if (mReceiveHandler)
-                                                            {
-                                                              mReceiveHandler(error, sz, std::move(message));
-                                                            }
-                                                            // Continue reading unless there's an error
-                                                            if (!error)
-                                                            {
-                                                              Read();
-                                                            } else {
-                                                              std::cout << "Read loop terminated due to error: " << error.message() << std::endl;
-                                                            }
-                                                          });
+    auto self(shared_from_this());
+    AsyncReadProtobufMessageHeader(mpSocket, mBuffer,
+                                   [self](const boost::system::error_code &error, size_t sz,
+                                          std::shared_ptr<ProtocolHeader> header)
+                                   {
+                                     self->HandleReadHeader(error, sz, header);
+                                   });
   }
 
-  bai::tcp::socket mSocket;
+  void ReadPayload(std::shared_ptr<ProtocolHeader> pHeader)
+  {
+    auto self(shared_from_this());
+    mData.clear();
+    mData.resize(pHeader->mPayloadSize);
+    std::cout << "mBuffer size: " << mData.size() << std::endl;
+    AsyncReadProtobufMessagePayload<filetransfer::ServerMessage>(mpSocket, mData, pHeader,
+                                                                 [self](const boost::system::error_code &error, size_t sz,
+                                                                        std::shared_ptr<filetransfer::ServerMessage> message)
+                                                                 {
+                                                                   self->HandleReadPayload(error, sz, message);
+                                                                 });
+  }
+
+  void HandleReadHeader(const boost::system::error_code &error, size_t transferredByte,
+                        std::shared_ptr<ProtocolHeader> header)
+  {
+    if (!error && header)
+    {
+      auto self(shared_from_this());
+      std::cout << "Read payload" << std::endl;
+      self->ReadPayload(header);
+    }
+    else
+    {
+      if (error == ba::error::eof)
+      {
+        std::cout << "EOF error" << std::endl;
+        return;
+      }
+      std::cout << "Error in HandleReadHeader: " << error.message() << std::endl;
+    }
+  }
+
+  void HandleReadPayload(const boost::system::error_code &error, size_t transferredByte,
+                         std::shared_ptr<filetransfer::ServerMessage> message)
+  {
+    if (!error && message)
+    {
+      if (mReceiveHandler)
+      {
+        mReceiveHandler(error, transferredByte, message);
+      }
+      ReadHeader();
+    }
+    else
+    {
+      if (error == ba::error::eof)
+      {
+        std::cout << "EOF error" << std::endl;
+        return;
+      }
+
+      std::cout << "Error in HandleReadPayload: " << error.message() << std::endl;
+    }
+  }
+
+  ba::io_context& mContext;
+  std::shared_ptr<bai::tcp::socket> mpSocket;
   bai::tcp::resolver mResolver;
   bai::tcp::resolver::results_type mEndpoints;
   ba::streambuf mBuffer;
+  std::vector<char> mData;
   ReceiveHandlerT mReceiveHandler;
+  ConnectCompletionHandlerT mConnectCompletionHandler;
 };
 
 enum class FileHandlerState : uint8_t
@@ -94,8 +157,7 @@ enum class FileHandlerState : uint8_t
 class FileHandler : public std::enable_shared_from_this<FileHandler>
 {
 public:
-  // Callback type for reporting final transfer status
-  using TransferCompletionHandlerT = std::function<void(bool success, const std::string& filename)>;
+  using TransferCompletionHandlerT = std::function<void(bool success, const std::string &filename)>;
 
   FileHandler(std::shared_ptr<Client> client)
       : mpClient(client)
@@ -103,7 +165,6 @@ public:
     mpClient->SetReceiveHandler(std::bind(&FileHandler::ReadHandler, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
   }
 
-  // Start method now takes a callback for completion
   void Start(std::string filename, TransferCompletionHandlerT completionHandler)
   {
     mInputFilename = filename;
@@ -128,11 +189,21 @@ public:
       SetTransferResult(false);
       return;
     }
+  }
+
+  void SendInitialFileRequest()
+  {
+    if (mState != FileHandlerState::INIT)
+    {
+      std::cerr << "FileHandler already started or in a non-initial state." << std::endl;
+      return;
+    }
 
     filetransfer::ClientMessage message;
     message.mutable_file_request()->set_filename(fs::path(mInputFilename).filename().string());
     message.mutable_file_request()->set_filesize(mInputFileSize);
 
+    std::cout << "Sending file transfer request for: " << fs::path(mInputFilename).filename() << std::endl;
     mpClient->Send(message, std::bind(&FileHandler::FileRequestSentHandler, shared_from_this(), std::placeholders::_1, std::placeholders::_2));
   }
 
@@ -140,8 +211,8 @@ public:
   {
     if (mState != FileHandlerState::COMPLETED && mState != FileHandlerState::FAILED && mState != FileHandlerState::STOPPED)
     {
-        mIsStopRequested = true;
-        std::cout << "Stop requested for file transfer." << std::endl;
+      mIsStopRequested = true;
+      std::cout << "\nStop requested for file transfer." << std::endl;
     }
     if (mInputFile.is_open())
     {
@@ -150,37 +221,44 @@ public:
   }
 
 private:
-  void FileRequestSentHandler(const boost::system::error_code& error, size_t /*bytes_transferred*/)
+  void FileRequestSentHandler(const boost::system::error_code &error, size_t /*bytes_transferred*/)
   {
-      if (error)
-      {
-          std::cerr << "File request send error: " << error.message() << std::endl;
-          mState = FileHandlerState::FAILED;
-          SetTransferResult(false);
-      }
-      else
-      {
-          std::cout << "File request sent for: " << fs::path(mInputFilename).filename() << std::endl;
-      }
+    if (error)
+    {
+      std::cerr << "\nFile request send error: " << error.message() << std::endl;
+      mState = FileHandlerState::FAILED;
+      SetTransferResult(false);
+    }
+    else
+    {
+      // Request sent, now waiting for server's initial status message in ReadHandler.
+      // No state change here.
+    }
   }
 
   void ReadHandler(const boost::system::error_code &error,
                    size_t /*bytesTransferred*/,
-                   std::unique_ptr<filetransfer::ServerMessage> message)
+                   std::shared_ptr<filetransfer::ServerMessage> message)
   {
+
     if (error)
     {
-      std::cerr << "Read error: " << error.message() << std::endl;
-      mState = FileHandlerState::FAILED;
-      SetTransferResult(false);
+      if (mState != FileHandlerState::COMPLETED && mState != FileHandlerState::FAILED && mState != FileHandlerState::STOPPED)
+      {
+        mState = FileHandlerState::FAILED;
+        SetTransferResult(false);
+      }
       return;
     }
 
     if (!message || !message->has_upload_status())
     {
-      std::cerr << "Received invalid or unexpected message from server." << std::endl;
-      mState = FileHandlerState::FAILED;
-      SetTransferResult(false);
+      std::cerr << "Received invalid or unexpected message from server (no upload status)." << std::endl;
+      if (mState != FileHandlerState::COMPLETED && mState != FileHandlerState::FAILED && mState != FileHandlerState::STOPPED)
+      {
+        mState = FileHandlerState::FAILED;
+        SetTransferResult(false);
+      }
       return;
     }
 
@@ -196,10 +274,10 @@ private:
 
     if (mIsStopRequested)
     {
-        std::cout << "\nFile transfer stopped by request." << std::endl;
-        mState = FileHandlerState::STOPPED;
-        SetTransferResult(false);
-        return;
+      std::cout << "\nFile transfer stopped by request." << std::endl;
+      mState = FileHandlerState::STOPPED;
+      SetTransferResult(false);
+      return;
     }
 
     switch (mState)
@@ -209,7 +287,7 @@ private:
       if (success)
       {
         mState = FileHandlerState::TRANSFER;
-        SendNextChunk(0);
+        SendNextChunk(0); // Start sending first chunk
       }
       else
       {
@@ -230,7 +308,7 @@ private:
         }
         else
         {
-          SendNextChunk(bytesReceived);
+          SendNextChunk(bytesReceived); // Send next chunk based on server's received bytes
         }
       }
       else
@@ -272,9 +350,9 @@ private:
   {
     if (mIsStopRequested)
     {
-        mState = FileHandlerState::STOPPED;
-        SetTransferResult(false);
-        return;
+      mState = FileHandlerState::STOPPED;
+      SetTransferResult(false);
+      return;
     }
 
     if (!mInputFile.is_open())
@@ -287,9 +365,9 @@ private:
 
     if (offset >= mInputFileSize)
     {
-        std::cout << "\nAll local data read. Sending finalization message." << std::endl;
-        SendUploadFinishedMessage();
-        return;
+      std::cout << "\nAll local data read. Sending finalization message." << std::endl;
+      SendUploadFinishedMessage();
+      return;
     }
 
     mInputFile.seekg(offset);
@@ -307,12 +385,12 @@ private:
 
     if (bytesRead == 0)
     {
-        std::cerr << "\nNo bytes read from file at offset " << offset << ". Unexpected." << std::endl;
-        mState = FileHandlerState::FAILED;
-        SetTransferResult(false);
-        return;
+      std::cerr << "\nNo bytes read from file at offset " << offset << ". Unexpected." << std::endl;
+      mState = FileHandlerState::FAILED;
+      SetTransferResult(false);
+      return;
     }
-    
+
     filetransfer::ClientMessage sendMessage;
     filetransfer::FileChunk *fileChunk = sendMessage.mutable_file_chunk();
     fileChunk->set_filename(fs::path(mInputFilename).filename().string());
@@ -323,52 +401,53 @@ private:
     mpClient->Send(sendMessage, std::bind(&FileHandler::ChunkSentHandler, shared_from_this(), std::placeholders::_1, std::placeholders::_2));
   }
 
-  void ChunkSentHandler(const boost::system::error_code& error, size_t /*bytes_transferred*/)
+  void ChunkSentHandler(const boost::system::error_code &error, size_t /*bytes_transferred*/)
   {
-      if (error)
-      {
-          std::cerr << "\nError sending file chunk: " << error.message() << std::endl;
-          mState = FileHandlerState::FAILED;
-          SetTransferResult(false);
-      }
+    if (error)
+    {
+      std::cerr << "\nError sending file chunk: " << error.message() << std::endl;
+      mState = FileHandlerState::FAILED;
+      SetTransferResult(false);
+    }
+    // If successful, the next action is driven by the server's status message (ReadHandler)
   }
 
   void SendUploadFinishedMessage()
   {
-      filetransfer::ClientMessage sendMessage;
-      filetransfer::FileUploadFinished* uploadFinished = sendMessage.mutable_upload_finished();
-      uploadFinished->set_filename(fs::path(mInputFilename).filename().string());
-      uploadFinished->set_message("Upload Finished");
+    filetransfer::ClientMessage sendMessage;
+    filetransfer::FileUploadFinished *uploadFinished = sendMessage.mutable_upload_finished();
+    uploadFinished->set_filename(fs::path(mInputFilename).filename().string());
+    uploadFinished->set_message("Upload Finished");
 
-      mpClient->Send(sendMessage, std::bind(&FileHandler::UploadFinishedSentHandler, shared_from_this(), std::placeholders::_1, std::placeholders::_2));
+    mpClient->Send(sendMessage, std::bind(&FileHandler::UploadFinishedSentHandler, shared_from_this(), std::placeholders::_1, std::placeholders::_2));
   }
 
-  void UploadFinishedSentHandler(const boost::system::error_code& error, size_t /*bytes_transferred*/)
+  void UploadFinishedSentHandler(const boost::system::error_code &error, size_t /*bytes_transferred*/)
   {
-      if (error)
-      {
-          std::cerr << "\nError sending upload finished message: " << error.message() << std::endl;
-          mState = FileHandlerState::FAILED;
-          SetTransferResult(false);
-      }
-      else
-      {
-          std::cout << "\nUpload finished message sent. Waiting for final server confirmation." << std::endl;
-      }
+    if (error)
+    {
+      std::cerr << "\nError sending upload finished message: " << error.message() << std::endl;
+      mState = FileHandlerState::FAILED;
+      SetTransferResult(false);
+    }
+    else
+    {
+      std::cout << "\nUpload finished message sent. Waiting for final server confirmation." << std::endl;
+    }
   }
 
   void SetTransferResult(bool success)
   {
-      if (mCompletionHandler && (mState == FileHandlerState::COMPLETED || mState == FileHandlerState::FAILED || mState == FileHandlerState::STOPPED))
-      {
-          mCompletionHandler(success, mInputFilename);
-          mCompletionHandler = nullptr;
-      }
-      
-      if (mInputFile.is_open())
-      {
-          mInputFile.close();
-      }
+    if (mCompletionHandler && (mState == FileHandlerState::COMPLETED || mState == FileHandlerState::FAILED || mState == FileHandlerState::STOPPED))
+    {
+      mCompletionHandler(success, mInputFilename);
+      mCompletionHandler = nullptr; // Clear the handler to prevent multiple calls
+    }
+
+    if (mInputFile.is_open())
+    {
+      mInputFile.close();
+    }
   }
 
   std::shared_ptr<Client> mpClient;
@@ -393,21 +472,25 @@ int main(int argc, char *argv[])
 
     ba::io_context context;
     std::shared_ptr<Client> client = std::make_shared<Client>(context, argv[1], argv[2]);
-    client->Start();
-
     std::shared_ptr<FileHandler> fileHandler = std::make_shared<FileHandler>(client);
 
-    std::thread io_thread([&context]() {
-      context.run();
-    });
+    client->Start([&context, fileHandler](const boost::system::error_code &error)
+                  {
+        if (!error) {
+            // Connection successful, now initiate the file transfer request
+            fileHandler->SendInitialFileRequest();
+        } else {
+            std::cerr << "Failed to connect to server, terminating." << std::endl;
+            context.stop();
+        } });
 
-    fileHandler->Start(argv[3], [&context](bool success, const std::string& filename) {
-        std::cout << "\nFile transfer of " << filename << " completed with status: " << (success ? "SUCCESS" : "FAILED") << std::endl;
-        context.stop();
-    });
+    fileHandler->Start(argv[3], [&context](bool success, const std::string &filename)
+                       {
+                         std::cout << "\nFile transfer of " << filename << " completed with status: " << (success ? "SUCCESS" : "FAILED") << std::endl;
+                         context.stop();
+                       });
 
-    io_thread.join();
-
+    context.run();
   }
   catch (const std::exception &e)
   {
